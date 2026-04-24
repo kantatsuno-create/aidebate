@@ -92,5 +92,10 @@ if _DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
 
     @app.get("/{full_path:path}")
-    async def spa(_full_path: str):
+    async def spa(full_path: str):
+        # Serve real files at root level (favicon.ico, vite.svg, etc.)
+        candidate = _DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        # Everything else → index.html (SPA client-side routing)
         return FileResponse(_DIST / "index.html")
