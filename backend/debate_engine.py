@@ -1,8 +1,10 @@
 import asyncio
+import json
+import os
 import re
 from typing import AsyncGenerator
 
-import anthropic
+import httpx
 
 ROUNDS = [
     {
@@ -46,6 +48,11 @@ ROUNDS = [
 PRO_NAME = "アレックス"
 CON_NAME = "サラ"
 JUDGE_NAME = "田中審判長"
+MODEL = "gemini-2.0-flash"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{MODEL}:streamGenerateContent"
+)
 
 
 def get_pro_system(topic: str) -> str:
@@ -112,8 +119,42 @@ def get_judge_system(topic: str) -> str:
 
 class DebateEngine:
     def __init__(self) -> None:
-        self.client = anthropic.AsyncAnthropic()
-        self.model = "claude-sonnet-4-6"
+        self._api_key = os.environ.get("GOOGLE_API_KEY", "")
+
+    async def _stream(
+        self, system: str, prompt: str, max_tokens: int = 1000
+    ) -> AsyncGenerator[str, None]:
+        payload = {
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": 0.9,
+            },
+        }
+        url = f"{GEMINI_URL}?key={self._api_key}&alt=sse"
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", url, json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                        text = (
+                            obj.get("candidates", [{}])[0]
+                            .get("content", {})
+                            .get("parts", [{}])[0]
+                            .get("text", "")
+                        )
+                        if text:
+                            yield text
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        continue
 
     async def run_debate(self, topic: str) -> AsyncGenerator[dict, None]:
         transcript: list[dict] = []
@@ -138,7 +179,9 @@ class DebateEngine:
                 own_speeches = pro_speeches if is_pro else con_speeches
                 opp_speeches = con_speeches if is_pro else pro_speeches
 
-                prompt = self._build_prompt(topic, round_info, own_speeches, opp_speeches, name, is_pro)
+                prompt = self._build_prompt(
+                    topic, round_info, own_speeches, opp_speeches, name, is_pro
+                )
 
                 yield {
                     "type": "speaker_start",
@@ -150,20 +193,16 @@ class DebateEngine:
                 }
 
                 speech = ""
-                async with self.client.messages.stream(
-                    model=self.model,
-                    max_tokens=1000,
-                    system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                    messages=[{"role": "user", "content": prompt}],
-                ) as stream:
-                    async for text in stream.text_stream:
-                        speech += text
-                        yield {"type": "token", "side": side, "text": text}
+                async for text in self._stream(system, prompt):
+                    speech += text
+                    yield {"type": "token", "side": side, "text": text}
 
                 (pro_speeches if is_pro else con_speeches).append(
                     {"round": round_info["name"], "text": speech}
                 )
-                transcript.append({"side": side, "name": name, "round": round_info["name"], "text": speech})
+                transcript.append(
+                    {"side": side, "name": name, "round": round_info["name"], "text": speech}
+                )
 
                 yield {"type": "speaker_end", "side": side}
                 await asyncio.sleep(0.3)
@@ -174,27 +213,21 @@ class DebateEngine:
 
         judge_text = ""
         transcript_str = self._format_transcript(transcript)
+        judge_prompt = (
+            f"以下のディベートを審判してください。\n\n"
+            f"【テーマ】{topic}\n\n"
+            f"【ディベート全記録】\n{transcript_str}\n\n"
+            "審判をお願いします。"
+        )
 
-        async with self.client.messages.stream(
-            model=self.model,
-            max_tokens=2000,
-            system=[{"type": "text", "text": get_judge_system(topic), "cache_control": {"type": "ephemeral"}}],
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"以下のディベートを審判してください。\n\n"
-                    f"【テーマ】{topic}\n\n"
-                    f"【ディベート全記録】\n{transcript_str}\n\n"
-                    "審判をお願いします。"
-                ),
-            }],
-        ) as stream:
-            async for text in stream.text_stream:
-                judge_text += text
-                yield {"type": "judge_token", "text": text}
+        async for text in self._stream(get_judge_system(topic), judge_prompt, max_tokens=2000):
+            judge_text += text
+            yield {"type": "judge_token", "text": text}
 
         winner = self._extract_winner(judge_text)
-        winner_name = PRO_NAME if winner == "pro" else (CON_NAME if winner == "con" else None)
+        winner_name = (
+            PRO_NAME if winner == "pro" else (CON_NAME if winner == "con" else None)
+        )
 
         yield {"type": "verdict", "winner": winner, "winner_name": winner_name}
         yield {"type": "debate_end"}
@@ -220,8 +253,7 @@ class DebateEngine:
 
         if own_speeches or opp_speeches:
             parts.append("\nこれまでの議論：")
-            max_len = max(len(own_speeches), len(opp_speeches))
-            for i in range(max_len):
+            for i in range(max(len(own_speeches), len(opp_speeches))):
                 if i < len(own_speeches):
                     s = own_speeches[i]
                     parts.append(f"\n[あなた（{own_side}） - {s['round']}]\n{s['text']}")
@@ -257,5 +289,4 @@ class DebateEngine:
             return "con"
         if pro_match and con_match:
             return "pro" if pro_match.start() > con_match.start() else "con"
-
         return "draw"
