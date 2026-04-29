@@ -48,7 +48,7 @@ ROUNDS = [
 PRO_NAME = "アレックス"
 CON_NAME = "サラ"
 JUDGE_NAME = "田中審判長"
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-flash-latest"
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"{MODEL}:streamGenerateContent"
@@ -134,27 +134,39 @@ class DebateEngine:
         }
         url = f"{GEMINI_URL}?key={self._api_key}&alt=sse"
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("POST", url, json=payload) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw or raw == "[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(raw)
-                        text = (
-                            obj.get("candidates", [{}])[0]
-                            .get("content", {})
-                            .get("parts", [{}])[0]
-                            .get("text", "")
-                        )
-                        if text:
-                            yield text
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        continue
+        for attempt in range(4):
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    async with client.stream("POST", url, json=payload) as resp:
+                        if resp.status_code == 429:
+                            wait = 2 ** attempt * 5  # 5s, 10s, 20s, 40s
+                            await asyncio.sleep(wait)
+                            continue
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            raw = line[5:].strip()
+                            if not raw or raw == "[DONE]":
+                                continue
+                            try:
+                                obj = json.loads(raw)
+                                text = (
+                                    obj.get("candidates", [{}])[0]
+                                    .get("content", {})
+                                    .get("parts", [{}])[0]
+                                    .get("text", "")
+                                )
+                                if text:
+                                    yield text
+                            except (json.JSONDecodeError, IndexError, KeyError):
+                                continue
+                        return  # success
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 and attempt < 3:
+                    await asyncio.sleep(2 ** attempt * 5)
+                    continue
+                raise
 
     async def run_debate(self, topic: str) -> AsyncGenerator[dict, None]:
         transcript: list[dict] = []
